@@ -1,0 +1,22 @@
+# Gradle
+.gradle/
+build/
+**/build/
+*.gradle.kts.dsl.cache
+
+# Android
+local.properties
+*.jks
+*.keystore
+!keystore.jks
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+
+# Generated
+gen/
+out/
