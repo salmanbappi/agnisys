@@ -43,7 +43,6 @@ import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Response
 import org.apache.commons.text.StringSubstitutor
-import org.jsoup.Jsoup
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.IOException
@@ -52,11 +51,14 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.UUID
 
+// ─── DTOs ────────────────────────────────────────────────────────────────────
+
 @Serializable(with = ItemTypeSerializer::class)
 enum class ItemType {
-    BoxSet, Movie, Season, Series, Episode, Other;
+    BoxSet, Movie, Season, Series, Episode, Folder, Other;
     companion object {
-        fun fromString(value: String): ItemType = values().find { it.name.equals(value, ignoreCase = true) } ?: Other
+        fun fromString(value: String): ItemType =
+            values().find { it.name.equals(value, ignoreCase = true) } ?: Other
     }
 }
 
@@ -67,73 +69,176 @@ object ItemTypeSerializer : KSerializer<ItemType> {
 }
 
 @Serializable data class ItemListDto(val items: List<ItemDto>, val totalRecordCount: Int)
+
 @Serializable data class ItemDto(
-    val name: String, val type: ItemType, val id: String, val locationType: String, val imageTags: ImageDto,
-    val collectionType: String? = null, val seriesId: String? = null, val seriesName: String? = null,
-    val seasonName: String? = null, val seriesPrimaryImageTag: String? = null, val status: String? = null,
-    val overview: String? = null, val genres: List<String>? = null, val studios: List<StudioDto>? = null,
-    val originalTitle: String? = null, val sortName: String? = null, val indexNumber: Int? = null,
-    val premiereDate: String? = null, val runTimeTicks: Long? = null, val dateCreated: String? = null,
-    val mediaSources: List<MediaDto>? = null
+    val name: String,
+    val type: ItemType,
+    val id: String,
+    val locationType: String = "",
+    val imageTags: ImageDto = ImageDto(),
+    val collectionType: String? = null,
+    val seriesId: String? = null,
+    val seriesName: String? = null,
+    val seasonName: String? = null,
+    val seriesPrimaryImageTag: String? = null,
+    val status: String? = null,
+    val overview: String? = null,
+    val genres: List<String>? = null,
+    val studios: List<StudioDto>? = null,
+    val originalTitle: String? = null,
+    val sortName: String? = null,
+    val indexNumber: Int? = null,
+    val premiereDate: String? = null,
+    val productionYear: Int? = null,
+    val communityRating: Float? = null,
+    val runTimeTicks: Long? = null,
+    val dateCreated: String? = null,
+    val mediaSources: List<MediaDto>? = null,
+    val officialRating: String? = null,
 ) {
     @Serializable data class ImageDto(val primary: String? = null)
-    @Serializable class StudioDto(val name: String)
+    @Serializable data class StudioDto(val name: String)
+
     fun toSAnime(baseUrl: String, userId: String): SAnime = SAnime.create().apply {
-        val typeMap = mapOf(ItemType.Season to "seriesId,$seriesId", ItemType.Movie to "movie", ItemType.BoxSet to "boxSet", ItemType.Series to "series")
-        url = baseUrl.toHttpUrl().newBuilder().addPathSegment("Users").addPathSegment(userId).addPathSegment("Items").addPathSegment(id).fragment(typeMap[type]).build().toString()
+        url = "$baseUrl/Users/$userId/Items/$id"
         thumbnail_url = imageTags.primary?.getImageUrl(baseUrl, id)
         title = name
-        description = overview?.replace("<br>", "\n")?.replace(Regex("<[^>]*>"), "")
+        description = buildString {
+            overview?.replace("<br>", "\n")?.replace(Regex("<[^>]*>"), "")?.let { append(it); append("\n\n") }
+            productionYear?.let { append("📅 Year: $it\n") }
+            communityRating?.let { append("⭐ Rating: ${"%.1f".format(it)}\n") }
+            officialRating?.let { append("🔞 Rating: $it\n") }
+        }.trim()
         genre = genres?.joinToString(", ")
         author = studios?.joinToString(", ") { it.name }
-        status = if (type == ItemType.Movie) SAnime.COMPLETED else this@ItemDto.status.parseStatus()
-        if (type == ItemType.Season) {
-            if (locationType == "Virtual") {
-                title = seriesName ?: "Season"
-                seriesId?.let { thumbnail_url = seriesPrimaryImageTag?.getImageUrl(baseUrl, it) }
-            } else { title = "$seriesName $name" }
-            if (imageTags.primary == null) seriesId?.let { thumbnail_url = seriesPrimaryImageTag?.getImageUrl(baseUrl, it) }
-        }
+        status = SAnime.COMPLETED
     }
-    private fun String?.parseStatus(): Int = when (this?.lowercase()) { "ended" -> SAnime.COMPLETED; "continuing" -> SAnime.ONGOING; else -> SAnime.UNKNOWN }
-    fun toSEpisode(baseUrl: String, userId: String, prefix: String, epDetails: Set<String>, episodeTemplate: String): SEpisode = SEpisode.create().apply {
-        val runtimeInSec = runTimeTicks?.div(10_000_000); val size = mediaSources?.firstOrNull()?.size?.formatBytes(); val runTime = runtimeInSec?.formatSeconds()
-        val epTitle = buildString { append(prefix); if (type != ItemType.Movie) append(this@ItemDto.name) }
-        val values = mapOf("title" to epTitle, "originalTitle" to (originalTitle ?: ""), "sortTitle" to (sortName ?: ""), "type" to type.name, "typeShort" to type.name.replace("Episode", "Ep."), "seriesTitle" to (seriesName ?: ""), "seasonTitle" to (seasonName ?: ""), "number" to (indexNumber?.toString() ?: ""), "createdDate" to (dateCreated?.substringBefore("T") ?: ""), "releaseDate" to (premiereDate?.substringBefore("T") ?: ""), "size" to (size ?: ""), "sizeBytes" to (mediaSources?.firstOrNull()?.size?.toString() ?: ""), "runtime" to (runTime ?: ""), "runtimeS" to (runtimeInSec?.toString() ?: ""))
-        val sub = StringSubstitutor(values, "{", "}")
-        val extraInfo = buildList { if (epDetails.contains("Overview") && overview != null && type == ItemType.Episode) add(overview); if (epDetails.contains("Size") && size != null) add(size); if (epDetails.contains("Runtime") && runTime != null) add(runTime) }
-        name = sub.replace(episodeTemplate).trim().removeSuffix("-").removePrefix("-").trim()
+
+    fun toSEpisode(baseUrl: String, userId: String): SEpisode = SEpisode.create().apply {
+        val runtimeInSec = runTimeTicks?.div(10_000_000)
+        val size = mediaSources?.firstOrNull()?.size?.formatBytes()
+        val extraInfo = buildList {
+            size?.let { add(it) }
+            runtimeInSec?.formatSeconds()?.let { add(it) }
+        }
+        name = this@ItemDto.name
         url = "$baseUrl/Users/$userId/Items/$id"
         scanlator = extraInfo.joinToString(" • ")
         premiereDate?.let { date_upload = parseDateTime(it) }
         indexNumber?.let { episode_number = it.toFloat() }
-        if (type == ItemType.Movie) episode_number = 1F
     }
-    private fun Long.formatSeconds(): String { val minutes = this / 60; val hours = minutes / 60; val rs = this % 60; val rm = minutes % 60; return "${if(hours>0)"${hours}h " else ""}${if(rm>0)"${rm}m " else ""}${rs}s".trim() }
-    private fun parseDateTime(date: String) = try { FORMATTER_DATE_TIME.parse(date.removeSuffix("Z"))!!.time } catch (_: Exception) { 0L }
-    companion object { private val FORMATTER_DATE_TIME = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ENGLISH) }
+
+    private fun Long.formatSeconds(): String {
+        val m = this / 60; val h = m / 60; val s = this % 60; val rm = m % 60
+        return "${if (h > 0) "${h}h " else ""}${if (rm > 0) "${rm}m " else ""}${s}s".trim()
+    }
+    private fun parseDateTime(date: String) =
+        try { FORMATTER.parse(date.substringBefore(".").removeSuffix("Z"))!!.time } catch (_: Exception) { 0L }
+    companion object { private val FORMATTER = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ENGLISH) }
 }
-@Serializable data class LoginDto(val accessToken: String, val sessionInfo: LoginSessionDto) { @Serializable data class LoginSessionDto(val userId: String) }
+
+@Serializable data class LoginDto(val accessToken: String, val sessionInfo: LoginSessionDto) {
+    @Serializable data class LoginSessionDto(val userId: String)
+}
 @Serializable data class MediaDto(val size: Long? = null, val id: String? = null)
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fun Long.formatBytes(): String = when {
     this >= 1_000_000_000L -> "%.2f GB".format(this / 1_000_000_000.0)
-    this >= 1_000_000L -> "%.2f MB".format(this / 1_000_000.0)
-    this >= 1_000L -> "%.2f KB".format(this / 1_000.0)
-    else -> "$this B"
-}
-fun String.getImageUrl(baseUrl: String, id: String): String = baseUrl.toHttpUrl().newBuilder().addPathSegment("Items").addPathSegment(id).addPathSegment("Images").addPathSegment("Primary").addQueryParameter("tag", this).build().toString()
-object PascalCaseToCamelCase : JsonNamingStrategy { override fun serialNameForJson(descriptor: SerialDescriptor, elementIndex: Int, serialName: String): String = serialName.replaceFirstChar { it.uppercase() } }
-fun getAuthHeader(deviceInfo: AgniSYS.DeviceInfo, token: String? = null): String {
-    val params = listOf("Client" to deviceInfo.clientName, "Version" to deviceInfo.version, "DeviceId" to deviceInfo.id, "Device" to deviceInfo.name, "Token" to token)
-    return params.filterNot { it.second == null }.joinToString(separator = ", ", prefix = "MediaBrowser ", transform = { "${it.first}=\"" + URLEncoder.encode(it.second!!.trim().replace("\n", " "), "UTF-8") + "\"" })
+    this >= 1_000_000L    -> "%.2f MB".format(this / 1_000_000.0)
+    this >= 1_000L        -> "%.2f KB".format(this / 1_000.0)
+    else                  -> "$this B"
 }
 
+fun String.getImageUrl(baseUrl: String, id: String): String =
+    baseUrl.toHttpUrl().newBuilder()
+        .addPathSegment("Items").addPathSegment(id)
+        .addPathSegment("Images").addPathSegment("Primary")
+        .addQueryParameter("tag", this)
+        .build().toString()
+
+object PascalCaseToCamelCase : JsonNamingStrategy {
+    override fun serialNameForJson(descriptor: SerialDescriptor, elementIndex: Int, serialName: String): String =
+        serialName.replaceFirstChar { it.uppercase() }
+}
+
+fun buildAuthHeader(deviceInfo: AgniSYS.DeviceInfo, token: String? = null): String {
+    val params = listOf(
+        "Client" to deviceInfo.clientName,
+        "Version" to deviceInfo.version,
+        "DeviceId" to deviceInfo.id,
+        "Device" to deviceInfo.name,
+        "Token" to token
+    )
+    return params.filterNot { it.second == null }
+        .joinToString(separator = ", ", prefix = "MediaBrowser ") {
+            "${it.first}=\"${URLEncoder.encode(it.second!!.trim().replace("\n", " "), "UTF-8")}\""
+        }
+}
+
+// ─── Filters ─────────────────────────────────────────────────────────────────
+
+/**
+ * All 17 libraries discovered on the server + an "All" catch-all.
+ * IDs are the actual Jellyfin collection folder IDs.
+ */
+private val CATEGORIES = listOf(
+    Pair("All Libraries", ""),
+    Pair("Bangla Movies", "d6d7796e127b01138f8c2c4dc4b60f02"),
+    Pair("Bollywood Movies", "21f5d92db0a8d1a5d0f526c8d8bca689"),
+    Pair("Hollywood Movies", "cb65dd976efcaf208a83ba21856d1f67"),
+    Pair("Animation Movies", "36b7cb06a8877931044683388b8dcc1f"),
+    Pair("Horror Movies", "2ee7ab9a0e71901f8c71f54989f7ccdc"),
+    Pair("Turkish Movies", "7e8896a2a0224459ee27eca3755892a5"),
+    Pair("Iranian Movies", "e9b085bb5dc880331ea45e3b69fdbd02"),
+    Pair("Korean & Hindi Movies", "a11aa43a6f987ab76773430ae0dee4db"),
+    Pair("Chinese Movies", "b7e59048a8aaa09c96afc730dc18124a"),
+    Pair("Web Series", "2704a4f904f147fd945a4f5b25ffa320"),
+    Pair("IMDB Top Movies", "cf72f09a5e3ed3b3b412def312048962"),
+    Pair("Tutorials", "0c3958d909ab63aeb7021619ffa5cac1"),
+    Pair("Collections", "9d7ad6afe9afa2dab1a2f6e00ad28fa6"),
+    Pair("Music Videos", "92f75a1a41e354235f4aded775720801"),
+)
+
+/** 27 genres found on the server */
+private val GENRES = listOf(
+    "Any", "Action", "Adult", "Adventure", "Animation", "Biography",
+    "Comedy", "Crime", "Documentary", "Drama", "Family", "Fantasy",
+    "History", "Horror", "Music", "Musical", "Mystery", "Reality-TV",
+    "Romance", "Science Fiction", "Sci-Fi", "Short", "Sport",
+    "Talk-Show", "Thriller", "TV Movie", "War", "Western"
+)
+
+private val SORT_OPTIONS = arrayOf("Name", "Date Added", "Rating", "Release Year", "Play Count")
+private val SORT_VALUES  = arrayOf("SortName", "DateCreated,SortName", "CommunityRating,SortName", "ProductionYear,SortName", "PlayCount,SortName")
+
+private class CategoryFilter(cats: List<Pair<String, String>>) :
+    AnimeFilter.Select<String>("Library", cats.map { it.first }.toTypedArray()) {
+    val cats = cats
+    fun selectedId() = cats[state].second
+}
+
+private class GenreFilter :
+    AnimeFilter.Select<String>("Genre", GENRES.toTypedArray()) {
+    fun selectedGenre() = if (state == 0) null else GENRES[state]
+}
+
+private class SortFilter :
+    AnimeFilter.Sort("Sort by", SORT_OPTIONS, Selection(0, true)) {
+    fun sortValue() = SORT_VALUES[state!!.index]
+    fun isAscending() = state!!.ascending
+}
+
+private class YearFilter : AnimeFilter.Text("Year (e.g. 2024)")
+
+// ─── Source ───────────────────────────────────────────────────────────────────
+
 class AgniSYS : Source(), UnmeteredSource, ConfigurableAnimeSource {
+
     override val name = "AgniSYS"
     override val lang = "all"
     override val supportsLatest = true
-    // Unique ID - different from Bijoy so both can coexist
     override val id: Long = 84759302158234567L
 
     private val prefs: SharedPreferences by lazy {
@@ -143,74 +248,116 @@ class AgniSYS : Source(), UnmeteredSource, ConfigurableAnimeSource {
     override val baseUrl: String
         get() = prefs.getString(PREF_BASE_URL, DEFAULT_URL)!!
 
-    override val json = Json { isLenient = true; ignoreUnknownKeys = true; namingStrategy = PascalCaseToCamelCase }
-    private val deviceInfo by lazy { getDeviceInfo(Injekt.get<Application>()) }
+    override val json = Json {
+        isLenient = true
+        ignoreUnknownKeys = true
+        namingStrategy = PascalCaseToCamelCase
+    }
 
+    private val deviceInfo by lazy { buildDeviceInfo(Injekt.get<Application>()) }
     private var accessToken: String by prefs.delegate("access_token", "")
     private var userId: String by prefs.delegate("user_id", "")
+
+    // ── OkHttp client with auto-login interceptor ──────────────────────────
 
     override val client = network.client.newBuilder()
         .dns(Dns.SYSTEM)
         .addInterceptor { chain ->
             val request = chain.request()
-            if (request.url.encodedPath.contains("AuthenticateByName")) return@addInterceptor chain.proceed(request)
+            // Skip auth on the login endpoint itself
+            if (request.url.encodedPath.contains("AuthenticateByName"))
+                return@addInterceptor chain.proceed(request)
 
-            if (accessToken.isBlank()) {
-                synchronized(this) {
-                    if (accessToken.isBlank()) login()
-                }
-            }
+            if (accessToken.isBlank()) synchronized(this) { if (accessToken.isBlank()) login() }
 
-            val authRequest = request.newBuilder()
-                .addHeader("Authorization", getAuthHeader(deviceInfo, accessToken))
+            val authed = request.newBuilder()
+                .addHeader("Authorization", buildAuthHeader(deviceInfo, accessToken))
                 .build()
 
-            val response = chain.proceed(authRequest)
+            val response = chain.proceed(authed)
             if (response.code == 401) {
                 synchronized(this) {
                     response.close()
                     login()
-                    val newAuthRequest = request.newBuilder()
-                        .addHeader("Authorization", getAuthHeader(deviceInfo, accessToken))
-                        .build()
-                    return@addInterceptor chain.proceed(newAuthRequest)
+                    chain.proceed(request.newBuilder()
+                        .addHeader("Authorization", buildAuthHeader(deviceInfo, accessToken))
+                        .build())
                 }
-            }
-            response
+            } else response
         }.build()
 
+    // ── Login ──────────────────────────────────────────────────────────────
+
     private fun login() {
-        val authHeaders = Headers.headersOf("Authorization", getAuthHeader(deviceInfo))
-        val body = buildJsonObject { put("Username", DEFAULT_USERNAME); put("Pw", DEFAULT_PASSWORD) }.toRequestBody(json)
-        val resp = network.client.newCall(POST("$baseUrl/Users/AuthenticateByName", authHeaders, body)).execute()
+        val headers = Headers.headersOf("Authorization", buildAuthHeader(deviceInfo))
+        val body = buildJsonObject {
+            put("Username", DEFAULT_USERNAME)
+            put("Pw", DEFAULT_PASSWORD)
+        }.toRequestBody(json)
+        val resp = network.client.newCall(POST("$baseUrl/Users/AuthenticateByName", headers, body)).execute()
         if (resp.isSuccessful) {
-            val loginDto = resp.parseAs<LoginDto>(json)
-            accessToken = loginDto.accessToken
-            userId = loginDto.sessionInfo.userId
+            val dto = resp.parseAs<LoginDto>(json)
+            accessToken = dto.accessToken
+            userId = dto.sessionInfo.userId
         } else {
             resp.close()
-            throw IOException("Login failed: ${resp.code}")
+            throw IOException("AgniSYS login failed: ${resp.code}")
         }
     }
 
-    override suspend fun getPopularAnime(page: Int): AnimesPage = getSearchAnime(page, "", AnimeFilterList())
+    // ── Browse ─────────────────────────────────────────────────────────────
 
-    override suspend fun getLatestUpdates(page: Int): AnimesPage {
-        val startIndex = (page - 1) * 20
-        val url = getItemsUrl(startIndex).newBuilder().apply { addQueryParameter("SortBy", "DateCreated,SortName"); addQueryParameter("SortOrder", "Descending") }.build()
+    /**
+     * Popular = sorted by CommunityRating DESC.
+     * This gives the highest-rated content first.
+     */
+    override suspend fun getPopularAnime(page: Int): AnimesPage {
+        val startIndex = (page - 1) * PAGE_SIZE
+        val url = baseItemsUrl(startIndex).newBuilder()
+            .setQueryParameter("SortBy", "CommunityRating,SortName")
+            .setQueryParameter("SortOrder", "Descending")
+            .build()
         return parseItemsPage(url, page)
     }
 
+    /**
+     * Latest = sorted by DateCreated DESC — newest additions to the library.
+     */
+    override suspend fun getLatestUpdates(page: Int): AnimesPage {
+        val startIndex = (page - 1) * PAGE_SIZE
+        val url = baseItemsUrl(startIndex).newBuilder()
+            .setQueryParameter("SortBy", "DateCreated,SortName")
+            .setQueryParameter("SortOrder", "Descending")
+            .build()
+        return parseItemsPage(url, page)
+    }
+
+    // ── Search + Filters ───────────────────────────────────────────────────
+
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
-        val startIndex = (page - 1) * 20
-        val url = getItemsUrl(startIndex).newBuilder().apply {
-            if (query.isNotBlank()) addQueryParameter("SearchTerm", query)
-            filters.forEach { filter ->
+        val startIndex = (page - 1) * PAGE_SIZE
+        val url = baseItemsUrl(startIndex).newBuilder().apply {
+            // Text search
+            if (query.isNotBlank()) setQueryParameter("SearchTerm", query)
+
+            // Apply each filter
+            for (filter in filters) {
                 when (filter) {
-                    is CategoryFilter -> if (filter.toValue().isNotBlank()) setQueryParameter("ParentId", filter.toValue())
+                    is CategoryFilter -> {
+                        val id = filter.selectedId()
+                        if (id.isNotBlank()) setQueryParameter("ParentId", id)
+                    }
+                    is GenreFilter -> {
+                        val genre = filter.selectedGenre()
+                        if (genre != null) setQueryParameter("Genres", genre)
+                    }
                     is SortFilter -> {
-                        setQueryParameter("SortBy", filter.toSortValue())
+                        setQueryParameter("SortBy", filter.sortValue())
                         setQueryParameter("SortOrder", if (filter.isAscending()) "Ascending" else "Descending")
+                    }
+                    is YearFilter -> {
+                        val year = filter.state.trim()
+                        if (year.isNotBlank()) setQueryParameter("Years", year)
                     }
                     else -> {}
                 }
@@ -220,138 +367,140 @@ class AgniSYS : Source(), UnmeteredSource, ConfigurableAnimeSource {
     }
 
     private suspend fun parseItemsPage(url: HttpUrl, page: Int): AnimesPage {
-        val items = client.newCall(GET(url)).await().parseAs<ItemListDto>(json)
-        val animeList = items.items.map { it.toSAnime(baseUrl, userId) }
-        return AnimesPage(animeList, 20 * page < items.totalRecordCount)
+        val dto = client.newCall(GET(url)).await().parseAs<ItemListDto>(json)
+        val animes = dto.items.map { it.toSAnime(baseUrl, userId) }
+        return AnimesPage(animes, PAGE_SIZE * page < dto.totalRecordCount)
     }
 
+    // ── Details ────────────────────────────────────────────────────────────
+
     override suspend fun getAnimeDetails(anime: SAnime): SAnime {
-        val item = client.newCall(GET(anime.url)).await().parseAs<ItemDto>(json)
+        val fields = "Genres,Studios,Overview,ProductionYear,CommunityRating,OfficialRating,MediaSources"
+        val url = "${anime.url}?Fields=$fields"
+        val item = client.newCall(GET(url)).await().parseAs<ItemDto>(json)
         return item.toSAnime(baseUrl, userId)
     }
 
+    // ── Episodes ───────────────────────────────────────────────────────────
+
+    /**
+     * For this server every piece of content is a Movie.
+     * Single-file items  → 1 episode
+     * Folders (Web Series) → list child Movies recursively
+     */
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
-        val url = anime.url.toHttpUrl()
-        val itemId = url.pathSegments.last()
-        val frag = url.fragment ?: ""
-        val epUrl = when {
-            frag.startsWith("series") -> "$baseUrl/Shows/$itemId/Episodes?Fields=DateCreated,OriginalTitle,SortName"
-            else -> anime.url
+        val item = client.newCall(GET(anime.url)).await().parseAs<ItemDto>(json)
+        return if (item.type == ItemType.Folder || item.type == ItemType.BoxSet) {
+            // Folder / collection → fetch children
+            val childUrl = "$baseUrl/Users/$userId/Items?ParentId=${item.id}&Recursive=true&IncludeItemTypes=Movie&SortBy=SortName&SortOrder=Ascending&Fields=MediaSources,OriginalTitle,SortName,Overview&Limit=500"
+            val children = client.newCall(GET(childUrl)).await().parseAs<ItemListDto>(json)
+            children.items.mapIndexed { idx, child ->
+                child.toSEpisode(baseUrl, userId).also { it.episode_number = (idx + 1).toFloat() }
+            }
+        } else {
+            // Single movie → wrap as 1 episode
+            listOf(
+                SEpisode.create().apply {
+                    name = item.name
+                    url = "${baseUrl}/Users/$userId/Items/${item.id}"
+                    episode_number = 1f
+                    date_upload = item.premiereDate?.let {
+                        try { SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ENGLISH).parse(it.substringBefore(".").removeSuffix("Z"))?.time ?: 0L } catch (_: Exception) { 0L }
+                    } ?: 0L
+                }
+            )
         }
-        val resp = client.newCall(GET(epUrl)).await()
-        val items = if (epUrl.contains("Episodes")) resp.parseAs<ItemListDto>(json).items else listOf(resp.parseAs<ItemDto>(json))
-        return items.map { it.toSEpisode(baseUrl, userId, "", emptySet(), "{number} - {title}") }.reversed()
     }
+
+    // ── Video ──────────────────────────────────────────────────────────────
 
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
         val item = client.newCall(GET(episode.url)).await().parseAs<ItemDto>(json)
-        val mediaSource = item.mediaSources?.firstOrNull() ?: return emptyList()
-        val videoHeaders = Headers.headersOf("Authorization", getAuthHeader(deviceInfo, accessToken))
-        val staticUrl = "$baseUrl/Videos/${item.id}/stream?static=True"
-        return listOf(Video(staticUrl, "Source", staticUrl, headers = videoHeaders))
+        val videoHeaders = Headers.headersOf("Authorization", buildAuthHeader(deviceInfo, accessToken))
+        val streams = mutableListOf<Video>()
+
+        // Direct stream (no transcoding)
+        val directUrl = "$baseUrl/Videos/${item.id}/stream?static=True&api_key=$accessToken"
+        streams.add(Video(directUrl, "Direct Stream", directUrl, headers = videoHeaders))
+
+        // Also offer a transcoded HLS stream for slow connections
+        val hlsUrl = "$baseUrl/Videos/${item.id}/master.m3u8?api_key=$accessToken&VideoCodec=h264&AudioCodec=aac&MaxStreamingBitrate=8000000"
+        streams.add(Video(hlsUrl, "HLS (8Mbps)", hlsUrl, headers = videoHeaders))
+
+        return streams
     }
 
-    private fun getItemsUrl(startIndex: Int): HttpUrl = "$baseUrl/Users/$userId/Items".toHttpUrl().newBuilder().apply {
-        addQueryParameter("StartIndex", startIndex.toString()); addQueryParameter("Limit", "20"); addQueryParameter("Recursive", "true")
-        addQueryParameter("IncludeItemTypes", "Movie,Series"); addQueryParameter("ImageTypeLimit", "1"); addQueryParameter("EnableImageTypes", "Primary")
-    }.build()
+    // ── Internals ──────────────────────────────────────────────────────────
 
-    data class DeviceInfo(val clientName: String, val version: String, val id: String, val name: String)
-    private fun getDeviceInfo(context: Application): DeviceInfo {
-        val deviceId = prefs.getString("device_id", null) ?: UUID.randomUUID().toString().replace("-", "").take(16).also { prefs.edit().putString("device_id", it).apply() }
-        return DeviceInfo("Aniyomi", "1.0.0", deviceId, Build.MODEL)
-    }
+    /**
+     * Base URL builder for /Users/{userId}/Items with common parameters.
+     * This server stores EVERYTHING as Movie type (even episodes/folders),
+     * so we use IncludeItemTypes=Movie,Folder to catch all content.
+     */
+    private fun baseItemsUrl(startIndex: Int): HttpUrl =
+        "$baseUrl/Users/$userId/Items".toHttpUrl().newBuilder().apply {
+            addQueryParameter("StartIndex", startIndex.toString())
+            addQueryParameter("Limit", PAGE_SIZE.toString())
+            addQueryParameter("Recursive", "true")
+            addQueryParameter("IncludeItemTypes", "Movie,Folder")
+            addQueryParameter("ImageTypeLimit", "1")
+            addQueryParameter("EnableImageTypes", "Primary")
+            addQueryParameter("Fields", "Genres,Studios,Overview,ProductionYear,CommunityRating,OfficialRating")
+            // Default sort: by name ascending (overridden per-call)
+            addQueryParameter("SortBy", "SortName")
+            addQueryParameter("SortOrder", "Ascending")
+        }.build()
+
+    private suspend fun okhttp3.Call.await(): Response = withContext(Dispatchers.IO) { execute() }
+
+    // ── Filter list ────────────────────────────────────────────────────────
+
+    override fun getFilterList(): AnimeFilterList = AnimeFilterList(
+        AnimeFilter.Header("── Library ─────────────────"),
+        CategoryFilter(CATEGORIES),
+        AnimeFilter.Separator(),
+        AnimeFilter.Header("── Genre ───────────────────"),
+        GenreFilter(),
+        AnimeFilter.Separator(),
+        AnimeFilter.Header("── Sort ────────────────────"),
+        SortFilter(),
+        AnimeFilter.Separator(),
+        AnimeFilter.Header("── Year ────────────────────"),
+        YearFilter(),
+    )
+
+    // ── Preferences ────────────────────────────────────────────────────────
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         EditTextPreference(screen.context).apply {
             key = PREF_BASE_URL
-            title = "Base URL"
-            summary = "AgniSYS Server URL (default: $DEFAULT_URL)"
+            title = "AgniSYS Server URL"
+            summary = "Default: $DEFAULT_URL"
             setDefaultValue(DEFAULT_URL)
             setOnPreferenceChangeListener { _, newValue ->
-                try {
-                    val newUrl = (newValue as String).trim()
-                    newUrl.toHttpUrl() // Validate URL
-                    true
-                } catch (e: Exception) {
-                    false
-                }
+                try { (newValue as String).trim().toHttpUrl(); true } catch (_: Exception) { false }
             }
         }.also(screen::addPreference)
     }
 
-    // Dynamic Filters
-    private var categoriesCache: List<Pair<String, String>>? = null
+    // ── Device info ────────────────────────────────────────────────────────
 
-    private fun fetchCategories(): List<Pair<String, String>> {
-        if (categoriesCache == null) {
-            val cachedJson = prefs.getString("pref_cached_categories", null)
-            if (cachedJson != null) {
-                try {
-                    val list = mutableListOf<Pair<String, String>>()
-                    val array = json.parseToJsonElement(cachedJson).jsonArray
-                    array.forEach {
-                        val obj = it.jsonObject
-                        val name = obj["name"]!!.jsonPrimitive.content
-                        val id = obj["id"]!!.jsonPrimitive.content
-                        list.add(Pair(name, id))
-                    }
-                    categoriesCache = list
-                } catch (e: Exception) { e.printStackTrace() }
-            }
-        }
+    data class DeviceInfo(val clientName: String, val version: String, val id: String, val name: String)
 
-        categoriesCache?.let { if (it.isNotEmpty()) return it }
-
-        val list = mutableListOf<Pair<String, String>>(Pair("All", ""))
-        try {
-            if (userId.isNotBlank()) {
-                val url = "$baseUrl/Users/$userId/Views"
-                val resp = client.newCall(GET(url)).execute()
-                if (resp.isSuccessful) {
-                    val views = resp.parseAs<ItemListDto>(json)
-                    views.items.forEach { list.add(Pair(it.name, it.id)) }
-
-                    val jsonArray = buildJsonArray {
-                        list.forEach { pair ->
-                            add(buildJsonObject {
-                                put("name", pair.first)
-                                put("id", pair.second)
-                            })
-                        }
-                    }
-                    prefs.edit().putString("pref_cached_categories", jsonArray.toString()).apply()
-                }
-            }
-        } catch (e: Exception) { e.printStackTrace() }
-        categoriesCache = list
-        return list
+    private fun buildDeviceInfo(context: Application): DeviceInfo {
+        val deviceId = prefs.getString("device_id", null)
+            ?: UUID.randomUUID().toString().replace("-", "").take(16)
+                .also { prefs.edit().putString("device_id", it).apply() }
+        return DeviceInfo("Aniyomi", "1.0.0", deviceId, Build.MODEL)
     }
 
-    override fun getFilterList(): AnimeFilterList {
-        val categories = fetchCategories()
-        return AnimeFilterList(
-            CategoryFilter(categories),
-            SortFilter()
-        )
-    }
-
-    private class CategoryFilter(val categories: List<Pair<String, String>>) : AnimeFilter.Select<String>("Category", categories.map { it.first }.toTypedArray()) {
-        fun toValue() = categories[state].second
-    }
-
-    private class SortFilter : AnimeFilter.Sort("Sort by", arrayOf("Name", "Date Added", "Premiere Date"), Selection(0, false)) {
-        private val sortables = arrayOf("SortName", "DateCreated", "ProductionYear")
-        fun toSortValue() = sortables[state!!.index]
-        fun isAscending() = state!!.ascending
-    }
-
-    private suspend fun okhttp3.Call.await(): Response = withContext(Dispatchers.IO) { execute() }
+    // ── Constants ──────────────────────────────────────────────────────────
 
     companion object {
-        private const val PREF_BASE_URL = "pref_base_url"
-        private const val DEFAULT_URL = "http://182.252.81.180:8096"
-        private const val DEFAULT_USERNAME = "vibe"
-        private const val DEFAULT_PASSWORD = "121121"
+        private const val PREF_BASE_URL      = "pref_base_url"
+        private const val DEFAULT_URL        = "http://182.252.81.180:8096"
+        private const val DEFAULT_USERNAME   = "vibe"
+        private const val DEFAULT_PASSWORD   = "121121"
+        private const val PAGE_SIZE          = 20
     }
 }
