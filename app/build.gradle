@@ -12,8 +12,8 @@ android {
         applicationId = "eu.kanade.tachiyomi.animeextension.all.agnisys"
         minSdk = 21
         targetSdk = 34
-        versionCode = 11002
-        versionName = "14.1002"
+        versionCode = 11003
+        versionName = "14.1003"
 
         manifestPlaceholders = [
             appName: "AgniSYS",
