@@ -456,16 +456,9 @@ class AgniSYS : Source(), UnmeteredSource, ConfigurableAnimeSource {
     // ── Filter list ────────────────────────────────────────────────────────
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
-        AnimeFilter.Header("── Library ─────────────────"),
         CategoryFilter(CATEGORIES),
-        AnimeFilter.Separator(),
-        AnimeFilter.Header("── Genre ───────────────────"),
         GenreFilter(),
-        AnimeFilter.Separator(),
-        AnimeFilter.Header("── Sort ────────────────────"),
         SortFilter(),
-        AnimeFilter.Separator(),
-        AnimeFilter.Header("── Year ────────────────────"),
         YearFilter(),
     )
 
