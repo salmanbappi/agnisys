@@ -313,7 +313,8 @@ class AgniSYS : Source(), UnmeteredSource, ConfigurableAnimeSource {
      */
     override suspend fun getPopularAnime(page: Int): AnimesPage {
         val startIndex = (page - 1) * PAGE_SIZE
-        val url = baseItemsUrl(startIndex).newBuilder()
+        // Popular always browses all libraries recursively (Movie only)
+        val url = baseItemsUrl(startIndex, parentId = null).newBuilder()
             .setQueryParameter("SortBy", "CommunityRating,SortName")
             .setQueryParameter("SortOrder", "Descending")
             .build()
@@ -325,7 +326,8 @@ class AgniSYS : Source(), UnmeteredSource, ConfigurableAnimeSource {
      */
     override suspend fun getLatestUpdates(page: Int): AnimesPage {
         val startIndex = (page - 1) * PAGE_SIZE
-        val url = baseItemsUrl(startIndex).newBuilder()
+        // Latest always browses all libraries recursively (Movie only)
+        val url = baseItemsUrl(startIndex, parentId = null).newBuilder()
             .setQueryParameter("SortBy", "DateCreated,SortName")
             .setQueryParameter("SortOrder", "Descending")
             .build()
@@ -336,17 +338,19 @@ class AgniSYS : Source(), UnmeteredSource, ConfigurableAnimeSource {
 
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         val startIndex = (page - 1) * PAGE_SIZE
-        val url = baseItemsUrl(startIndex).newBuilder().apply {
+
+        // Extract parentId first — it controls whether we browse recursively or not
+        val categoryFilter = filters.filterIsInstance<CategoryFilter>().firstOrNull()
+        val parentId = categoryFilter?.selectedId()?.takeIf { it.isNotBlank() }
+
+        val url = baseItemsUrl(startIndex, parentId).newBuilder().apply {
             // Text search
             if (query.isNotBlank()) setQueryParameter("SearchTerm", query)
 
-            // Apply each filter
+            // Apply remaining filters (skip CategoryFilter — already baked into baseItemsUrl)
             for (filter in filters) {
                 when (filter) {
-                    is CategoryFilter -> {
-                        val id = filter.selectedId()
-                        if (id.isNotBlank()) setQueryParameter("ParentId", id)
-                    }
+                    is CategoryFilter -> { /* handled above via parentId */ }
                     is GenreFilter -> {
                         val genre = filter.selectedGenre()
                         if (genre != null) setQueryParameter("Genres", genre)
@@ -433,22 +437,37 @@ class AgniSYS : Source(), UnmeteredSource, ConfigurableAnimeSource {
     // ── Internals ──────────────────────────────────────────────────────────
 
     /**
-     * Base URL builder for /Users/{userId}/Items with common parameters.
-     * This server stores EVERYTHING as Movie type (even episodes/folders),
-     * so we use IncludeItemTypes=Movie,Folder to catch all content.
+     * Base URL builder for /Users/{userId}/Items.
+     *
+     * KEY INSIGHT from live server inspection:
+     *   - With NO parentId (All Libraries): Recursive=true, Movie only — 24,461 items
+     *   - With parentId (specific library): NO Recursive — shows direct children.
+     *     e.g. Web Series library direct children = 25 Folder items (one per show)
+     *          Bangla Movies direct children = 295 Movie/Folder items
+     *
+     * This prevents Web Series from flooding the list with 837 individual episodes.
+     * Instead, each series shows as one Folder card; tapping it fetches child episodes.
      */
-    private fun baseItemsUrl(startIndex: Int): HttpUrl =
+    private fun baseItemsUrl(startIndex: Int, parentId: String? = null): HttpUrl =
         "$baseUrl/Users/$userId/Items".toHttpUrl().newBuilder().apply {
             addQueryParameter("StartIndex", startIndex.toString())
             addQueryParameter("Limit", PAGE_SIZE.toString())
-            addQueryParameter("Recursive", "true")
-            addQueryParameter("IncludeItemTypes", "Movie,Folder")
             addQueryParameter("ImageTypeLimit", "1")
             addQueryParameter("EnableImageTypes", "Primary")
             addQueryParameter("Fields", "Genres,Studios,Overview,ProductionYear,CommunityRating,OfficialRating")
-            // Default sort: by name ascending (overridden per-call)
             addQueryParameter("SortBy", "SortName")
             addQueryParameter("SortOrder", "Ascending")
+
+            if (parentId != null) {
+                // Specific library selected: show direct children (Folder or Movie)
+                // NO Recursive — prevents flooding with all sub-episodes
+                addQueryParameter("ParentId", parentId)
+                addQueryParameter("IncludeItemTypes", "Movie,Folder")
+            } else {
+                // All Libraries: recurse through everything, Movies only
+                addQueryParameter("Recursive", "true")
+                addQueryParameter("IncludeItemTypes", "Movie")
+            }
         }.build()
 
     private suspend fun okhttp3.Call.await(): Response = withContext(Dispatchers.IO) { execute() }
